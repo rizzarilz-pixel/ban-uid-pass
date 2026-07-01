@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-FREE FIRE BAN TOOL - FLASK API
+FREE FIRE BAN TOOL - FLASK API (Vercel Compatible)
 ============================================================
 """
 
@@ -732,9 +732,14 @@ def ban_account_token_get():
         }), 500
 
 # ============================================================
-# ENTRY POINT
+# ENTRY POINT FOR VERCEL
 # ============================================================
 
+# Untuk Vercel, kita export app sebagai handler
+# Vercel akan menggunakan ini sebagai entry point
+handler = app
+
+# Untuk local development
 if __name__ == "__main__":
     print("=" * 60)
     print("🔥 FREE FIRE BAN API - FLASK SERVER v2.0")
@@ -749,4 +754,6 @@ if __name__ == "__main__":
     print("   GET  /              - API information")
     print("\n" + "=" * 60)
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Untuk development lokal, kita jalanin dengan host 0.0.0.0
+    # Vercel akan mengabaikan ini dan menggunakan handler
+    app.run(host='0.0.0.0', port=5000)
