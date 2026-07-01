@@ -1,4 +1,8 @@
-Flask==2.3.2
-Flask-CORS==4.0.0
-aiohttp==3.8.5
-pycryptodome==3.18.0
+Flask[async]
+requests
+aiohttp
+googleapis-common-protos
+pycryptodome
+protobuf
+Werkzeug
+flask-cors==4.0.0
