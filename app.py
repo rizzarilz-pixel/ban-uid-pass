@@ -14,6 +14,7 @@ import random
 import sys
 from datetime import datetime
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
@@ -35,6 +36,15 @@ PLATFORM_NAMES = {
 }
 
 app = Flask(__name__)
+
+# Enable CORS for all routes
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # ============================================================
 # PROTOBUF
@@ -423,19 +433,24 @@ async def ban_with_credentials(uid, password):
         "data": {}
     }
     
-    async with FreeFireClient() as client:
-        # Step 1 - Get access token from JWT API
-        print(f"\n   🔑 Getting access token for UID: {uid}")
-        access_token = await client.get_access_token(uid, password)
-        
-        if not access_token:
-            result["message"] = "Failed to get access token. Check UID and password."
-            return result
-        
-        print(f"   ✅ Access token obtained successfully")
-        
-        # Step 2 - Proceed with ban using the token
-        return await perform_ban(client, access_token)
+    try:
+        async with FreeFireClient() as client:
+            # Step 1 - Get access token from JWT API
+            print(f"\n   🔑 Getting access token for UID: {uid}")
+            access_token = await client.get_access_token(uid, password)
+            
+            if not access_token:
+                result["message"] = "Failed to get access token. Check UID and password."
+                return result
+            
+            print(f"   ✅ Access token obtained successfully")
+            
+            # Step 2 - Proceed with ban using the token
+            return await perform_ban(client, access_token)
+    except Exception as e:
+        print(f"❌ Error in ban_with_credentials: {e}")
+        result["message"] = f"Error: {str(e)}"
+        return result
 
 async def ban_with_token(access_token):
     """Ban account using existing access token"""
@@ -445,8 +460,13 @@ async def ban_with_token(access_token):
         "data": {}
     }
     
-    async with FreeFireClient() as client:
-        return await perform_ban(client, access_token)
+    try:
+        async with FreeFireClient() as client:
+            return await perform_ban(client, access_token)
+    except Exception as e:
+        print(f"❌ Error in ban_with_token: {e}")
+        result["message"] = f"Error: {str(e)}"
+        return result
 
 async def perform_ban(client, access_token):
     """Core ban logic"""
@@ -456,103 +476,112 @@ async def perform_ban(client, access_token):
         "data": {}
     }
     
-    # Step 1 - Inspect token
-    print("   🔍 Inspecting token...")
-    open_id, platform = await client.inspect_token(access_token)
-    
-    if not open_id:
-        result["message"] = "Token invalid or expired"
+    try:
+        # Step 1 - Inspect token
+        print("   🔍 Inspecting token...")
+        open_id, platform = await client.inspect_token(access_token)
+        
+        if not open_id:
+            result["message"] = "Token invalid or expired"
+            return result
+        
+        pname = PLATFORM_NAMES.get(platform, f'Platform-{platform}')
+        print(f"   ✅ Token valid - Platform: {pname}")
+        
+        # Step 2 - Build and encrypt payload
+        major_payload     = Protocol.build_major_login(open_id, access_token, platform)
+        encrypted_payload = Crypto.encrypt(major_payload)
+        
+        # Step 3 - MajorLogin
+        print("   🔐 Sending MajorLogin...")
+        major_response = await client.major_login(encrypted_payload)
+        if not major_response:
+            result["message"] = "Account already banned or server rejected"
+            return result
+        
+        major_data = Protocol.parse_major_login_response(major_response)
+        if not major_data.get("account_uid"):
+            result["message"] = "MajorLogin response parse failed"
+            return result
+        
+        print(f"   ✅ MajorLogin success - UID: {major_data['account_uid']}")
+        
+        # Step 4 - GetLoginData
+        print("   📡 Getting login data...")
+        login_response = await client.get_login_data(
+            major_data["url"], major_data["token"], encrypted_payload
+        )
+        if not login_response:
+            result["message"] = "GetLoginData failed"
+            return result
+        
+        login_info = Protocol.parse_login_data(login_response)
+        name       = login_info.get("account_name", "Unknown")
+        online     = login_info.get("online_ip_port", "")
+        chat       = login_info.get("account_ip_port", "")
+        
+        if not online or ":" not in online:
+            result["message"] = "Server IP not found - account already banned"
+            return result
+        
+        print(f"   ✅ Account: {name} (UID: {login_info.get('account_uid')})")
+        
+        # Step 5 - Create auth packet
+        auth_packet = Protocol.create_auth_packet(
+            major_data["account_uid"],
+            major_data["token"],
+            major_data["timestamp"],
+            major_data["key"],
+            major_data["iv"]
+        )
+        
+        online_ip,  online_port = online.split(":")
+        chat_ip,    chat_port   = chat.split(":") if chat and ":" in chat else (online_ip, online_port)
+        
+        # Step 6 - TCP connections
+        print(f"   🌐 Connecting to Online server: {online_ip}:{online_port}")
+        online_ok, _ = await client.tcp_connect(online_ip, online_port, auth_packet, "Online")
+        print(f"   🌐 Connecting to Chat server: {chat_ip}:{chat_port}")
+        chat_ok,   _ = await client.tcp_connect(chat_ip,   chat_port,   auth_packet, "Chat")
+        
+        # Step 7 - Prepare result
+        if online_ok or chat_ok:
+            result["success"] = True
+            result["message"] = "Ban successful"
+            result["data"] = {
+                "platform": pname,
+                "platform_id": platform,
+                "name": name,
+                "uid": str(major_data["account_uid"]),
+                "region": major_data["region"],
+                "online_server": online_ok,
+                "chat_server": chat_ok
+            }
+            print("   ✅ Ban successful!")
+        else:
+            result["message"] = "Ban failed - TCP connection failed"
+            result["data"] = {
+                "online_server": online_ok,
+                "chat_server": chat_ok
+            }
+            print("   ❌ Ban failed - TCP connection failed")
+        
         return result
-    
-    pname = PLATFORM_NAMES.get(platform, f'Platform-{platform}')
-    print(f"   ✅ Token valid - Platform: {pname}")
-    
-    # Step 2 - Build and encrypt payload
-    major_payload     = Protocol.build_major_login(open_id, access_token, platform)
-    encrypted_payload = Crypto.encrypt(major_payload)
-    
-    # Step 3 - MajorLogin
-    print("   🔐 Sending MajorLogin...")
-    major_response = await client.major_login(encrypted_payload)
-    if not major_response:
-        result["message"] = "Account already banned or server rejected"
+    except Exception as e:
+        print(f"❌ Error in perform_ban: {e}")
+        import traceback
+        traceback.print_exc()
+        result["message"] = f"Error: {str(e)}"
         return result
-    
-    major_data = Protocol.parse_major_login_response(major_response)
-    if not major_data.get("account_uid"):
-        result["message"] = "MajorLogin response parse failed"
-        return result
-    
-    print(f"   ✅ MajorLogin success - UID: {major_data['account_uid']}")
-    
-    # Step 4 - GetLoginData
-    print("   📡 Getting login data...")
-    login_response = await client.get_login_data(
-        major_data["url"], major_data["token"], encrypted_payload
-    )
-    if not login_response:
-        result["message"] = "GetLoginData failed"
-        return result
-    
-    login_info = Protocol.parse_login_data(login_response)
-    name       = login_info.get("account_name", "Unknown")
-    online     = login_info.get("online_ip_port", "")
-    chat       = login_info.get("account_ip_port", "")
-    
-    if not online or ":" not in online:
-        result["message"] = "Server IP not found - account already banned"
-        return result
-    
-    print(f"   ✅ Account: {name} (UID: {login_info.get('account_uid')})")
-    
-    # Step 5 - Create auth packet
-    auth_packet = Protocol.create_auth_packet(
-        major_data["account_uid"],
-        major_data["token"],
-        major_data["timestamp"],
-        major_data["key"],
-        major_data["iv"]
-    )
-    
-    online_ip,  online_port = online.split(":")
-    chat_ip,    chat_port   = chat.split(":") if chat and ":" in chat else (online_ip, online_port)
-    
-    # Step 6 - TCP connections
-    print(f"   🌐 Connecting to Online server: {online_ip}:{online_port}")
-    online_ok, _ = await client.tcp_connect(online_ip, online_port, auth_packet, "Online")
-    print(f"   🌐 Connecting to Chat server: {chat_ip}:{chat_port}")
-    chat_ok,   _ = await client.tcp_connect(chat_ip,   chat_port,   auth_packet, "Chat")
-    
-    # Step 7 - Prepare result
-    if online_ok or chat_ok:
-        result["success"] = True
-        result["message"] = "Ban successful"
-        result["data"] = {
-            "platform": pname,
-            "platform_id": platform,
-            "name": name,
-            "uid": str(major_data["account_uid"]),
-            "region": major_data["region"],
-            "online_server": online_ok,
-            "chat_server": chat_ok
-        }
-        print("   ✅ Ban successful!")
-    else:
-        result["message"] = "Ban failed - TCP connection failed"
-        result["data"] = {
-            "online_server": online_ok,
-            "chat_server": chat_ok
-        }
-        print("   ❌ Ban failed - TCP connection failed")
-    
-    return result
 
 # ============================================================
 # FLASK API ROUTES
 # ============================================================
 
-@app.route('/', methods=['GET'])
+@app.route('/', methods=['GET', 'OPTIONS'])
 def index():
+    if request.method == 'OPTIONS':
+        return '', 200
     return jsonify({
         "name": "Free Fire Ban API",
         "version": "2.0",
@@ -567,16 +596,21 @@ def index():
         }
     })
 
-@app.route('/health', methods=['GET'])
+@app.route('/health', methods=['GET', 'OPTIONS'])
 def health():
+    if request.method == 'OPTIONS':
+        return '', 200
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
-@app.route('/ban', methods=['POST'])
+@app.route('/ban', methods=['POST', 'OPTIONS'])
 def ban_account():
     """
     Ban a Free Fire account using UID and Password
     Expected JSON: {"uid": "your_uid", "password": "your_password"}
     """
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     try:
         data = request.get_json()
         if not data:
@@ -593,10 +627,13 @@ def ban_account():
         print(f"{'='*60}")
         
         # Run the ban process with credentials
+        # Create new event loop for each request
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(ban_with_credentials(uid, password))
-        loop.close()
+        try:
+            result = loop.run_until_complete(ban_with_credentials(uid, password))
+        finally:
+            loop.close()
         
         print(f"{'='*60}\n")
         
@@ -634,8 +671,10 @@ def ban_account_get():
         # Run the ban process with credentials
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(ban_with_credentials(uid, password))
-        loop.close()
+        try:
+            result = loop.run_until_complete(ban_with_credentials(uid, password))
+        finally:
+            loop.close()
         
         print(f"{'='*60}\n")
         
@@ -653,12 +692,15 @@ def ban_account_get():
             "error": str(e)
         }), 500
 
-@app.route('/ban/token', methods=['POST'])
+@app.route('/ban/token', methods=['POST', 'OPTIONS'])
 def ban_account_token():
     """
     Ban a Free Fire account using access token (legacy method)
     Expected JSON: {"access_token": "your_token_here"}
     """
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     try:
         data = request.get_json()
         if not data:
@@ -675,8 +717,10 @@ def ban_account_token():
         # Run the ban process with token
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(ban_with_token(access_token))
-        loop.close()
+        try:
+            result = loop.run_until_complete(ban_with_token(access_token))
+        finally:
+            loop.close()
         
         print(f"{'='*60}\n")
         
@@ -712,8 +756,10 @@ def ban_account_token_get():
         # Run the ban process with token
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(ban_with_token(access_token))
-        loop.close()
+        try:
+            result = loop.run_until_complete(ban_with_token(access_token))
+        finally:
+            loop.close()
         
         print(f"{'='*60}\n")
         
@@ -754,6 +800,5 @@ if __name__ == "__main__":
     print("   GET  /              - API information")
     print("\n" + "=" * 60)
     
-    # Untuk development lokal, kita jalanin dengan host 0.0.0.0
-    # Vercel akan mengabaikan ini dan menggunakan handler
+    # Untuk development lokal
     app.run(host='0.0.0.0', port=5000)
